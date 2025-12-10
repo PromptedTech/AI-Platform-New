@@ -1,0 +1,3172 @@
+import { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { useRouter } from 'next/router';
+import { signOut } from 'firebase/auth';
+import { auth, db } from '../lib/firebase';
+import { collection, addDoc, query, orderBy, onSnapshot, where, doc, setDoc, updateDoc, getDoc, deleteDoc } from 'firebase/firestore';
+import { trackChat, trackImage } from '../lib/analytics';
+import { useTheme } from '../contexts/ThemeContext';
+import ThemeSelector from '../components/ThemeSelector';
+import axios from 'axios';
+import { getChatTemplates, getImageTemplates } from '../lib/templates';
+import { getUserCredits, deductCredits } from '../lib/credits';
+import CreditsModal from '../components/CreditsModal';
+import { motion, AnimatePresence } from 'framer-motion';
+import { MessageSquare, Image as ImageIcon, Sparkles, Library, User, Coins, Clock, Zap, Bug, Menu, X, Home, Settings, LogOut, ChevronLeft, ChevronRight, Plus, Search, MoreVertical, Edit3, Trash2, Calendar, Clipboard, Check, Paperclip, Mic, Send, RotateCcw, Square } from 'lucide-react';
+import FeedbackModal from '../components/FeedbackModal';
+import ShareButton from '../components/ShareButton';
+
+// Timestamp utility functions
+const formatTimestamp = (timestamp) => {
+  if (!timestamp) return '';
+  
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffInMinutes = Math.floor((now - date) / (1000 * 60));
+  
+  if (diffInMinutes < 1) return 'Just now';
+  if (diffInMinutes < 60) return `${diffInMinutes}m ago`;
+  if (diffInMinutes < 1440) return `${Math.floor(diffInMinutes / 60)}h ago`;
+  if (diffInMinutes < 10080) return `${Math.floor(diffInMinutes / 1440)}d ago`;
+  
+  // For older messages, show HH:mm format
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
+const formatFullTimestamp = (timestamp) => {
+  if (!timestamp) return '';
+  
+  const date = new Date(timestamp);
+  return date.toLocaleString([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+};
+
+// Typing Animation Component
+const TypingAnimation = () => (
+  <motion.div
+    initial={{ opacity: 0, scale: 0.8 }}
+    animate={{ opacity: 1, scale: 1 }}
+    exit={{ opacity: 0, scale: 0.8 }}
+    className="flex items-center gap-3 px-5 py-4 rounded-2xl border shadow-sm transition-all duration-400 bg-[#121620] border-[#1f2532] text-[#e5e7eb]"
+  >
+    <div className="flex space-x-1">
+      <motion.div
+        className="w-2 h-2 rounded-full bg-[#8b5cf6]"
+        animate={{ scale: [1, 1.3, 1], opacity: [0.5, 1, 0.5] }}
+        transition={{ duration: 0.8, repeat: Infinity, delay: 0 }}
+      />
+      <motion.div
+        className="w-2 h-2 rounded-full bg-[#8b5cf6]"
+        animate={{ scale: [1, 1.3, 1], opacity: [0.5, 1, 0.5] }}
+        transition={{ duration: 0.8, repeat: Infinity, delay: 0.2 }}
+      />
+      <motion.div
+        className="w-2 h-2 rounded-full bg-[#8b5cf6]"
+        animate={{ scale: [1, 1.3, 1], opacity: [0.5, 1, 0.5] }}
+        transition={{ duration: 0.8, repeat: Infinity, delay: 0.4 }}
+      />
+    </div>
+    <span className="text-sm text-[#9ca3af] font-medium">AI is thinking...</span>
+  </motion.div>
+);
+
+// Typing Effect Component for AI Messages
+const TypingMessage = ({ message, onComplete }) => {
+  const [displayedText, setDisplayedText] = useState('');
+  const [currentIndex, setCurrentIndex] = useState(0);
+
+  useEffect(() => {
+    if (currentIndex < message.length) {
+      const timer = setTimeout(() => {
+        setDisplayedText(prev => prev + message[currentIndex]);
+        setCurrentIndex(prev => prev + 1);
+      }, 20); // Adjust speed here (lower = faster typing)
+
+      return () => clearTimeout(timer);
+    } else if (onComplete) {
+      onComplete();
+    }
+  }, [currentIndex, message, onComplete]);
+
+  return (
+    <div className="prose prose-sm max-w-none prose-headings:text-[#e5e7eb] prose-p:text-[#e5e7eb] prose-code:text-[#e5e7eb] prose-code:bg-[#1f2532] prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-[#121620] prose-pre:text-[#e5e7eb] prose-pre:border prose-pre:border-[#1f2532]">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedText}</ReactMarkdown>
+      {currentIndex < message.length && (
+        <motion.span
+          className="inline-block w-2 h-4 bg-[#8b5cf6] ml-1"
+          animate={{ opacity: [0, 1, 0] }}
+          transition={{ duration: 0.8, repeat: Infinity }}
+        />
+      )}
+    </div>
+  );
+};
+
+// Message Status Indicator Components
+const MessageStatusIndicator = ({ status, messageId, onRetry }) => {
+  const getStatusIcon = () => {
+    switch (status) {
+      case 'sending':
+        return (
+          <motion.div
+            className="w-3 h-3 sm:w-3 sm:h-3 border-2 border-blue-400/40 border-t-blue-500 rounded-full"
+            animate={{ rotate: 360 }}
+            transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+            aria-label="Message sending"
+          />
+        );
+      case 'success':
+        return (
+          <motion.div
+            initial={{ scale: 0, rotate: -180 }}
+            animate={{ scale: 1, rotate: 0 }}
+            transition={{ duration: 0.4, type: "spring", stiffness: 300, damping: 20 }}
+            className="w-3 h-3 sm:w-3 sm:h-3 bg-emerald-500 rounded-full flex items-center justify-center shadow-sm"
+            aria-label="Message sent successfully"
+          >
+            <Check className="w-2 h-2 text-white" />
+          </motion.div>
+        );
+      case 'error':
+        return (
+          <motion.div
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{ duration: 0.3, type: "spring" }}
+            className="w-3 h-3 sm:w-3 sm:h-3 bg-red-500 rounded-full flex items-center justify-center cursor-pointer hover:bg-red-600 hover:scale-110 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-red-400/50 shadow-sm"
+            onClick={onRetry}
+            title="Click to retry"
+            aria-label="Message failed, click to retry"
+            tabIndex={0}
+          >
+            <X className="w-2 h-2 text-white" />
+          </motion.div>
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.8 }}
+      transition={{ duration: 0.2 }}
+      className="flex items-center justify-center"
+    >
+      {getStatusIcon()}
+    </motion.div>
+  );
+};
+
+export default function Dashboard({ user }) {
+  const { isDark, toggleTheme } = useTheme();
+  const router = useRouter();
+  const [activeTab, setActiveTab] = useState('chat'); // 'chat', 'image', or 'library'
+  // Model selection state (persisted)
+  const [chatModel, setChatModel] = useState('gpt-4o-mini');
+  const [temperature, setTemperature] = useState(0.7);
+  const [maxTokens, setMaxTokens] = useState(800);
+  // Threads (chat history)
+  const [threads, setThreads] = useState([]); // [{id, title, updatedAt}]
+  const [activeThreadId, setActiveThreadId] = useState(null);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [threadToDelete, setThreadToDelete] = useState(null);
+  // Templates
+  const chatTemplates = getChatTemplates();
+  const imageTemplates = getImageTemplates();
+  const [showChatTemplates, setShowChatTemplates] = useState(false);
+  const [showImageTemplates, setShowImageTemplates] = useState(false);
+  // Credits
+  const [credits, setCredits] = useState(null);
+  const [showCreditsModal, setShowCreditsModal] = useState(false);
+  
+  // Feedback Modal
+  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+  // Profile
+  const [displayName, setDisplayName] = useState('');
+  // Persona state from customAIs
+  const [activePersona, setActivePersona] = useState(null); // {id, name, prompt, avatar}
+  const [availablePersonas, setAvailablePersonas] = useState([]); // List of user's custom AIs
+
+  // Load persisted model on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('chat:model');
+      if (saved) setChatModel(saved);
+      const savedTemp = localStorage.getItem('chat:temperature');
+      if (savedTemp) setTemperature(parseFloat(savedTemp));
+      const savedMax = localStorage.getItem('chat:maxTokens');
+      if (savedMax) setMaxTokens(parseInt(savedMax, 10));
+    } catch {}
+  }, []);
+
+  // Load user credits, profile, and persona if provided via query
+  useEffect(() => {
+    if (!user) return;
+    const loadUserData = async () => {
+      try {
+        const balance = await getUserCredits(user.uid);
+        setCredits(balance);
+        
+        // Load display name from profile
+        const profileRef = doc(db, 'profiles', user.uid);
+        const profileSnap = await getDoc(profileRef);
+        if (profileSnap.exists()) {
+          const data = profileSnap.data();
+          setDisplayName(data.displayName || user.email);
+        } else {
+          setDisplayName(user.email);
+        }
+
+        // Load persona by id from router query
+        const personaId = router.query?.persona;
+        if (personaId) {
+          try {
+            const personaSnap = await getDoc(doc(db, 'customAIs', String(personaId)));
+            if (personaSnap.exists() && personaSnap.data().uid === user.uid) {
+              const p = personaSnap.data();
+              setActivePersona({ id: personaId, name: p.name, prompt: p.prompt, avatar: p.avatar });
+            } else {
+              setActivePersona(null);
+            }
+          } catch (e) {
+            setActivePersona(null);
+          }
+        } else {
+          setActivePersona(null);
+        }
+      } catch (error) {
+        console.error('Error loading user data:', error);
+        setDisplayName(user.email);
+      }
+    };
+    loadUserData();
+  }, [user, router.query]);
+  
+  // Chat state
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [typingMessage, setTypingMessage] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  
+  // Navigation state
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [inputPulse, setInputPulse] = useState(false);
+  const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+  
+  // Chat history management
+  const [searchQuery, setSearchQuery] = useState('');
+  const [hoveredThread, setHoveredThread] = useState(null);
+  const [editingThread, setEditingThread] = useState(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [switchingChat, setSwitchingChat] = useState(false);
+  
+  // Copy message functionality
+  const [copiedMessageId, setCopiedMessageId] = useState(null);
+  const [showCopyToast, setShowCopyToast] = useState(false);
+  
+  // Dropdown menu state
+  const [showMenu, setShowMenu] = useState(null);
+  
+  // Timestamp refresh state
+  const [timestampRefresh, setTimestampRefresh] = useState(0);
+  
+  // Message status tracking
+  const [messageStatuses, setMessageStatuses] = useState({});
+  const [pendingMessageId, setPendingMessageId] = useState(null);
+  
+  // Theme selector state
+  const [isThemeSelectorOpen, setIsThemeSelectorOpen] = useState(false);
+  
+  // File upload and RAG state
+  const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [selectedFiles, setSelectedFiles] = useState([]);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadError, setUploadError] = useState('');
+  const [useKnowledge, setUseKnowledge] = useState(false);
+
+  // Refresh timestamps every minute
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTimestampRefresh(prev => prev + 1);
+    }, 60000); // Update every minute
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Keyboard navigation for chat messages
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        // Close any open modals or focus on input
+        const activeElement = document.activeElement;
+        if (activeElement && activeElement.blur) {
+          activeElement.blur();
+        }
+        // Focus on chat input
+        const chatInput = document.getElementById('chat-input');
+        if (chatInput) {
+          chatInput.focus();
+        }
+      }
+      
+      // Handle Tab navigation for messages
+      if (e.key === 'Tab' && e.shiftKey === false) {
+        const focusedElement = document.activeElement;
+        if (focusedElement && focusedElement.getAttribute('role') === 'article') {
+          // If focused on a message, allow natural tab flow
+          return;
+        }
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Smooth scroll to bottom
+  const scrollToBottom = () => {
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({ 
+        behavior: 'smooth',
+        block: 'end',
+        inline: 'nearest'
+      });
+    }
+  };
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      scrollToBottom();
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [messages.length]);
+
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    const timer = setTimeout(scrollToBottom, 100);
+    return () => clearTimeout(timer);
+  }, [messages, isTyping]);
+  
+  // Image generation state
+  const [imagePrompt, setImagePrompt] = useState('');
+  const [generatedImage, setGeneratedImage] = useState(null);
+  const [imageLoading, setImageLoading] = useState(false);
+  const [imageHistory, setImageHistory] = useState([]);
+  // Error states
+  const [chatError, setChatError] = useState('');
+  const [imageError, setImageError] = useState('');
+  // Timing (chat latency)
+  const thinkTimerRef = useRef(null);
+  const thinkStartRef = useRef(0);
+  const [thinkElapsed, setThinkElapsed] = useState(0);
+  const [lastResponseTime, setLastResponseTime] = useState(null);
+  
+  // Regenerate and stop generation state
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isStopRequested, setIsStopRequested] = useState(false);
+  const abortControllerRef = useRef(null);
+
+  // Load user's threads (chat history)
+  useEffect(() => {
+    if (!user) return;
+    const qThreads = query(
+      collection(db, 'threads'),
+      where('userId', '==', user.uid),
+      orderBy('updatedAt', 'desc')
+    );
+    const unsubThreads = onSnapshot(qThreads, (snap) => {
+      const items = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        items.push({ id: d.id, title: data.title || 'New Chat', updatedAt: data.updatedAt });
+      });
+      setThreads(items);
+      // If no active thread selected, auto select most recent
+      if (!activeThreadId && items.length > 0) {
+        setActiveThreadId(items[0].id);
+      }
+    });
+    return () => unsubThreads();
+  }, [user]);
+
+  // Load user's custom AI personas
+  useEffect(() => {
+    if (!user) return;
+    const qPersonas = query(
+      collection(db, 'customAIs'),
+      where('uid', '==', user.uid),
+      orderBy('createdAt', 'desc')
+    );
+    const unsubPersonas = onSnapshot(qPersonas, (snap) => {
+      const personas = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        personas.push({ 
+          id: d.id, 
+          name: data.name, 
+          prompt: data.prompt, 
+          avatar: data.avatar 
+        });
+      });
+      setAvailablePersonas(personas);
+    });
+    return () => unsubPersonas();
+  }, [user]);
+
+  // Load messages for active thread
+  useEffect(() => {
+    if (!user || !activeThreadId) return;
+    
+    // First try to load from new chat document format
+    const chatRef = doc(db, 'chats', activeThreadId);
+    const unsubChat = onSnapshot(chatRef, (doc) => {
+      if (doc.exists()) {
+        const chatData = doc.data();
+        // Only load if this chat belongs to the current user
+        if (chatData.userId === user.uid && chatData.messages && chatData.messages.length > 0) {
+          // New format: messages stored in single document
+          const messages = chatData.messages.map((msg, index) => ({
+            role: msg.role,
+            content: msg.text || msg.content,
+            timestamp: msg.timestamp || new Date().toISOString(),
+          }));
+          console.log('Loading messages from new format:', messages);
+          setMessages(messages);
+          return;
+        }
+      }
+      
+      // If new format doesn't exist or is empty, load from old format
+      const qMsgs = query(
+        collection(db, 'chats'),
+        where('userId', '==', user.uid),
+        where('threadId', '==', activeThreadId),
+        orderBy('timestamp', 'asc')
+      );
+      
+      const unsubOld = onSnapshot(qMsgs, (snap) => {
+        const list = [];
+        snap.forEach((d) => {
+          const data = d.data();
+          // Skip if this is a chat document (has messages array) or doesn't belong to user
+          if (!data.messages && data.userId === user.uid) {
+            list.push({ 
+              role: data.role, 
+              content: data.content, 
+              timestamp: data.timestamp || new Date().toISOString()
+            });
+          }
+        });
+        console.log('Loading messages from old format:', list);
+        setMessages(list);
+      }, (error) => {
+        console.error('Error loading old format messages:', error);
+        setMessages([]);
+      });
+      
+      return () => unsubOld();
+    }, (error) => {
+      console.error('Error loading chat document:', error);
+      setMessages([]);
+    });
+    
+    return () => unsubChat();
+  }, [user, activeThreadId]);
+  const deriveTitle = (text) => {
+    const t = (text || '').replace(/\n/g, ' ').trim();
+    return t.length > 40 ? t.slice(0, 40) + '…' : t || 'New Chat';
+  };
+
+  // Handle chat switching with smooth transitions
+  const handleChatSwitch = async (threadId) => {
+    setSwitchingChat(true);
+    setActiveThreadId(threadId);
+    setMessages([]); // Clear current messages for smooth transition
+    
+    // Small delay for smooth transition effect
+    setTimeout(() => {
+      setSwitchingChat(false);
+    }, 200);
+  };
+
+  // Copy message to clipboard
+  const copyMessage = async (messageText, messageId) => {
+    try {
+      await navigator.clipboard.writeText(messageText);
+      setCopiedMessageId(messageId);
+      setShowCopyToast(true);
+      
+      // Reset the copied state after 2 seconds
+      setTimeout(() => {
+        setCopiedMessageId(null);
+        setShowCopyToast(false);
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to copy text: ', err);
+      // Fallback for older browsers
+      const textArea = document.createElement('textarea');
+      textArea.value = messageText;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      
+      setCopiedMessageId(messageId);
+      setShowCopyToast(true);
+      setTimeout(() => {
+        setCopiedMessageId(null);
+        setShowCopyToast(false);
+      }, 2000);
+    }
+  };
+
+  // Retry failed message
+  const retryMessage = async (messageId) => {
+    const message = messages.find(msg => msg.id === messageId);
+    if (!message || !user) return;
+
+    // Reset status to sending
+    setMessageStatuses(prev => ({ ...prev, [messageId]: 'sending' }));
+    setPendingMessageId(messageId);
+    setChatError('');
+
+    try {
+      // Get current chat document and update it
+      const threadId = await ensureActiveThread();
+      const chatRef = doc(db, 'chats', threadId);
+      const chatDoc = await getDoc(chatRef);
+      const nowIso = new Date().toISOString();
+      
+      if (chatDoc.exists()) {
+        const currentMessages = chatDoc.data().messages || [];
+        
+        // Add user message
+        const updatedMessages = [
+          ...currentMessages,
+          {
+            role: 'user',
+            text: message.content,
+            timestamp: nowIso,
+          }
+        ];
+        
+        // Generate title from first message if it's still "New Chat"
+        let title = chatDoc.data().title;
+        if (title === 'New Chat' && currentMessages.length === 0) {
+          title = deriveTitle(message.content);
+        }
+        
+        await updateDoc(chatRef, {
+          messages: updatedMessages,
+          title: title,
+          updatedAt: nowIso,
+        });
+        
+        // Also update the threads collection
+        const tRef = doc(db, 'threads', threadId);
+        await updateDoc(tRef, {
+          title: title,
+          updatedAt: nowIso,
+        });
+      }
+
+      // Make API call
+      const response = await axios.post('/api/chat', {
+        message: message.content,
+        model: chatModel,
+        customPrompt: selectedCustomAI ? await getCustomAIPrompt() : '',
+        recentMessages: await getRecentMessages(),
+      });
+
+      // Mark as successful
+      setMessageStatuses(prev => ({ ...prev, [messageId]: 'success' }));
+      setPendingMessageId(null);
+
+      // Add AI response
+      const assistantMessage = {
+        role: 'assistant',
+        content: response.data.reply,
+        timestamp: new Date().toISOString(),
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+
+      // Save AI response to Firestore
+      const assistantTimestamp = new Date().toISOString();
+      const finalChatRef = doc(db, 'chats', threadId);
+      const finalChatDoc = await getDoc(finalChatRef);
+      
+      if (finalChatDoc.exists()) {
+        const currentMessages = finalChatDoc.data().messages || [];
+        const updatedMessages = [
+          ...currentMessages,
+          {
+            role: 'ai',
+            text: response.data.reply,
+            timestamp: assistantTimestamp,
+          }
+        ];
+        
+        await updateDoc(finalChatRef, {
+          messages: updatedMessages,
+          updatedAt: assistantTimestamp,
+        });
+      }
+
+    } catch (error) {
+      console.error('Error retrying message:', error);
+      setMessageStatuses(prev => ({ ...prev, [messageId]: 'error' }));
+      setPendingMessageId(null);
+      setChatError('Failed to retry message. Please try again.');
+    }
+  };
+
+  const ensureActiveThread = async () => {
+    if (activeThreadId) return activeThreadId;
+    // Create a new thread
+    const newId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    await setDoc(doc(db, 'threads', newId), {
+      userId: user.uid,
+      title: 'New Chat',
+      createdAt: now,
+      updatedAt: now,
+    });
+    setActiveThreadId(newId);
+    return newId;
+  };
+
+  const handleNewChat = async () => {
+    if (!user) return;
+    
+    // Create new chat document
+    const newId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    
+    try {
+      await setDoc(doc(db, 'chats', newId), {
+        chatId: newId,
+        userId: user.uid,
+        title: 'New Chat',
+        messages: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+      
+      // Also create thread document for sidebar
+      await setDoc(doc(db, 'threads', newId), {
+        userId: user.uid,
+        title: 'New Chat',
+        chatId: newId,
+        createdAt: now,
+        updatedAt: now,
+      });
+      
+      setActiveThreadId(newId);
+      setMessages([]);
+    } catch (error) {
+      console.error('Error creating new chat:', error);
+    }
+  };
+
+  const handleRenameThread = async (threadId, newTitle) => {
+    if (!user || !newTitle.trim()) return;
+    try {
+      await updateDoc(doc(db, 'threads', threadId), {
+        title: newTitle.trim(),
+        updatedAt: new Date().toISOString(),
+      });
+      setEditingThread(null);
+      setEditTitle('');
+    } catch (error) {
+      console.error('Error renaming thread:', error);
+    }
+  };
+
+  const handleDeleteThread = async (threadId) => {
+    if (!user) return;
+    try {
+      // Delete all messages in this thread
+      const messagesQuery = query(
+        collection(db, 'chats'),
+        where('userId', '==', user.uid),
+        where('threadId', '==', threadId)
+      );
+      
+      // Note: Firestore doesn't support batch delete in client SDK easily
+      // For now, we'll delete the thread and let messages be orphaned
+      // In production, you'd want to use a Cloud Function for this
+      await deleteDoc(doc(db, 'threads', threadId));
+      
+      // If this was the active thread, clear it
+      if (activeThreadId === threadId) {
+        setActiveThreadId(null);
+        setMessages([]);
+      }
+      
+      // Close modal
+      setShowDeleteModal(false);
+      setThreadToDelete(null);
+    } catch (error) {
+      console.error('Error deleting thread:', error);
+    }
+  };
+
+  const confirmDeleteThread = (thread) => {
+    setThreadToDelete(thread);
+    setShowDeleteModal(true);
+  };
+
+  // Load image history from Firestore
+  useEffect(() => {
+    if (!user) return;
+
+    const q = query(
+      collection(db, 'images'),
+      where('userId', '==', user.uid),
+      orderBy('timestamp', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const loadedImages = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        loadedImages.push({
+          url: data.imageUrl,
+          prompt: data.prompt,
+          timestamp: data.timestamp,
+        });
+      });
+      setImageHistory(loadedImages);
+      if (loadedImages.length > 0 && !generatedImage) {
+        setGeneratedImage(loadedImages[0]);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Handle logout
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      router.push('/');
+    } catch (error) {
+      console.error('Error signing out:', error);
+    }
+  };
+
+  // Handle typing completion
+  const handleTypingComplete = (messageIndex) => {
+    setMessages(prev => 
+      prev.map((msg, idx) => 
+        idx === messageIndex && msg.isTyping 
+          ? { ...msg, isTyping: false }
+          : msg
+      )
+    );
+  };
+
+  // Get current chat title
+  const getCurrentChatTitle = () => {
+    if (!activeThreadId) return "New Chat";
+    const currentThread = threads.find(t => t.id === activeThreadId);
+    return currentThread?.title || "New Chat";
+  };
+
+  // Handle regenerate response
+  const handleRegenerateResponse = async (messageIndex) => {
+    if (!user) return;
+    
+    // Find the user message that triggered this AI response
+    if (messageIndex === 0 || messages[messageIndex - 1].role !== 'user') {
+      return; // Can't regenerate if there's no user message before this
+    }
+    
+    const userMessage = messages[messageIndex - 1];
+    
+    // Remove the old AI message
+    const updatedMessages = messages.slice(0, messageIndex);
+    setMessages(updatedMessages);
+    
+    // Check credits
+    if (typeof credits === 'number' && credits < 1) {
+      setChatError('Insufficient credits to regenerate response.');
+      return;
+    }
+    
+    // Deduct credit optimistically
+    const originalCredits = credits;
+    setCredits((prev) => (typeof prev === 'number' ? Math.max(prev - 1, 0) : prev));
+    
+    setChatError('');
+    setLastResponseTime(null);
+    setChatLoading(true);
+    setIsGenerating(true);
+    setIsStopRequested(false);
+    
+    // Start timing
+    setThinkElapsed(0);
+    thinkStartRef.current = Date.now();
+    if (thinkTimerRef.current) clearInterval(thinkTimerRef.current);
+    thinkTimerRef.current = setInterval(() => {
+      setThinkElapsed(Math.floor((Date.now() - thinkStartRef.current) / 1000));
+    }, 1000);
+    
+    try {
+      const systemMessages = activePersona?.prompt
+        ? [{ role: 'system', content: activePersona.prompt }]
+        : [];
+      
+      // Use messages up to the user message (excluding the regenerated AI response)
+      const lastMessages = updatedMessages.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
+      
+      // Create abort controller for stop functionality
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      
+      const response = await axios.post('/api/chat', {
+        messages: [...systemMessages, ...lastMessages],
+        model: chatModel,
+        temperature,
+        max_tokens: maxTokens,
+        uid: user.uid,
+        customPrompt: activePersona?.prompt || null,
+      }, { signal: controller.signal });
+      
+      if (isStopRequested) {
+        return; // User stopped generation
+      }
+      
+      if (response.data?.error) {
+        setChatError(response.data.error);
+      } else {
+        const assistantMessage = {
+          role: 'assistant',
+          content: response.data.reply,
+        };
+        
+        const threadId = activeThreadId;
+        const assistantTimestamp = new Date().toISOString();
+        const chatRef = doc(db, 'chats', threadId);
+        const chatDoc = await getDoc(chatRef);
+        
+        if (chatDoc.exists()) {
+          const currentMessages = chatDoc.data().messages || [];
+          const updatedMessagesFirestore = [
+            ...currentMessages,
+            {
+              role: 'ai',
+              text: assistantMessage.content,
+              timestamp: assistantTimestamp,
+            }
+          ];
+          
+          await updateDoc(chatRef, {
+            messages: updatedMessagesFirestore,
+            updatedAt: assistantTimestamp,
+          });
+        }
+        
+        try { await trackChat(user.uid); } catch (e) { console.warn('trackChat failed', e); }
+        await updateDoc(doc(db, 'threads', threadId), { updatedAt: new Date().toISOString() });
+        
+        setIsTyping(true);
+        setTypingMessage(response.data.reply);
+        
+        setMessages([...updatedMessages, { ...assistantMessage, isTyping: true }]);
+        
+        const totalSecs = Math.max(1, Math.floor((Date.now() - thinkStartRef.current) / 1000));
+        setLastResponseTime(totalSecs);
+        
+        try {
+          await deductCredits(user.uid, 1);
+        } catch (err) {
+          console.error('Error saving credit deduction:', err);
+        }
+      }
+    } catch (error) {
+      if (axios.isCancel(error) || error.message === 'canceled') {
+        console.log('Request canceled by user');
+        return;
+      }
+      console.error('Error regenerating response:', error);
+      setChatError('Failed to regenerate response. Please try again.');
+      setCredits(originalCredits);
+      try {
+        const currentBalance = await getUserCredits(user.uid);
+        setCredits(currentBalance);
+      } catch (err) {
+        console.error('Error fetching credits:', err);
+      }
+    } finally {
+      setChatLoading(false);
+      setIsTyping(false);
+      setIsGenerating(false);
+      abortControllerRef.current = null;
+      if (thinkTimerRef.current) {
+        clearInterval(thinkTimerRef.current);
+        thinkTimerRef.current = null;
+      }
+    }
+  };
+  
+  // Handle stop generation
+  const handleStopGeneration = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    setIsStopRequested(true);
+    setIsGenerating(false);
+    setChatLoading(false);
+    setIsTyping(false);
+    if (thinkTimerRef.current) {
+      clearInterval(thinkTimerRef.current);
+      thinkTimerRef.current = null;
+    }
+  };
+  
+  // Handle file upload (multipart FormData to /api/upload)
+  const handleFileUpload = async (files) => {
+    if (!user || !files || files.length === 0) return;
+    setUploadError('');
+    setUploadProgress(0);
+    setUploadLoading(true);
+
+    try {
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('uid', user.uid);
+
+        let response;
+        try {
+          response = await axios.post('/api/upload', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            onUploadProgress: (evt) => {
+              if (evt.total) {
+                const pct = Math.round((evt.loaded * 100) / evt.total);
+                setUploadProgress(pct);
+              }
+            },
+          });
+          console.log('[upload] status', response.status, response.data);
+        } catch (err) {
+          const status = err?.response?.status;
+          const data = err?.response?.data;
+          console.error('[upload] failed', status, data);
+          if (status === 405 || status === 413) {
+            setChatError('Method not allowed or payload too large — enable multipart + raise sizeLimit');
+          } else {
+            setChatError('Failed to upload file. Please try again.');
+          }
+          if (data?.error && String(data.error).toLowerCase().includes('permission')) {
+            console.error('[upload] permission error (client)', data);
+          }
+          throw err;
+        }
+
+        const { ok, filename, mimetype, size, fileId } = response.data || {};
+        if (!ok) {
+          setChatError('Upload failed.');
+          continue;
+        }
+
+        const newFileItem = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: filename || file.name,
+          type: mimetype || file.type,
+          size: typeof size === 'number' ? size : file.size,
+          uploadedAt: new Date().toISOString(),
+        };
+
+        // Prefer real Firestore fileId if provided
+        if (fileId) newFileItem.id = fileId;
+
+        setUploadedFiles(prev => [
+          ...prev,
+          newFileItem
+        ]);
+
+        // Auto-select newly uploaded file for this chat turn
+        setSelectedFiles(prev => [...prev, newFileItem]);
+      }
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      setUploadError('Upload failed');
+    } finally {
+      setUploadLoading(false);
+      setUploadProgress(0);
+      // Clear the hidden input so selecting the same file again triggers onChange
+      try { if (fileInputRef.current) fileInputRef.current.value = ''; } catch {}
+    }
+  };
+  
+  // Handle chat submission
+  const handleChatSubmit = async (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() && selectedFiles.length === 0) {
+      // Pulse animation for empty action
+      setInputPulse(true);
+      setTimeout(() => setInputPulse(false), 300);
+      return;
+    }
+    if (!user) return;
+
+    setChatError('');
+    setLastResponseTime(null);
+
+    // Check credits before sending (client-side only)
+    if (typeof credits === 'number' && credits < 1) {
+      setChatError('Insufficient credits to send message.');
+      return;
+    }
+
+    // Deduct credit optimistically on client
+    const originalCredits = credits;
+    setCredits((prev) => (typeof prev === 'number' ? Math.max(prev - 1, 0) : prev));
+
+    const messageId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const userMessage = { 
+      role: 'user', 
+      content: chatInput || '(Using attached knowledge)',
+      id: messageId,
+      timestamp: new Date().toISOString(),
+      attachments: selectedFiles.map(f => ({ id: f.id, name: f.name, type: f.type, size: f.size }))
+    };
+    const threadId = await ensureActiveThread();
+    const updatedMessages = [...messages, userMessage];
+    // Optimistically render user's message
+    setMessages(updatedMessages);
+    setMessageStatuses(prev => ({ ...prev, [messageId]: 'sending' }));
+    setPendingMessageId(messageId);
+    setChatInput('');
+    setChatLoading(true);
+    setIsGenerating(true);
+    setIsStopRequested(false);
+    // start timing
+    setThinkElapsed(0);
+    thinkStartRef.current = Date.now();
+    if (thinkTimerRef.current) clearInterval(thinkTimerRef.current);
+    thinkTimerRef.current = setInterval(() => {
+      setThinkElapsed(Math.floor((Date.now() - thinkStartRef.current) / 1000));
+    }, 1000);
+
+    try {
+      // Create abort controller for stop functionality
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      // Get current chat document and update it
+      const chatRef = doc(db, 'chats', threadId);
+      const chatDoc = await getDoc(chatRef);
+      const nowIso = new Date().toISOString();
+      
+      if (chatDoc.exists()) {
+        const currentMessages = chatDoc.data().messages || [];
+        
+        // Add user message
+        const updatedMessages = [
+          ...currentMessages,
+          {
+            role: 'user',
+            text: userMessage.content,
+            timestamp: nowIso,
+            attachments: userMessage.attachments || []
+          }
+        ];
+        
+        // Generate title from first user message if it's still "New Chat"
+        let title = chatDoc.data().title;
+        if (title === 'New Chat' && currentMessages.length === 0) {
+          title = deriveTitle(userMessage.content);
+        }
+        
+        // Update chat document with user message
+        await updateDoc(chatRef, {
+          messages: updatedMessages,
+          title: title,
+          updatedAt: nowIso,
+        });
+        
+        // Update thread metadata
+        const tRef = doc(db, 'threads', threadId);
+        await updateDoc(tRef, { title, updatedAt: nowIso });
+      }
+
+      // Build knowledge context (RAG) if files selected or useKnowledge enabled
+      let knowledgeMessages = [];
+      try {
+        if (selectedFiles.length > 0 || useKnowledge) {
+          const k = 6;
+          const fileIds = selectedFiles.map(f => f.id);
+          const searchRes = await axios.post('/api/search-embeds', {
+            userId: user.uid,
+            query: chatInput || '(no query text provided)'.trim(),
+            k,
+            fileIds,
+          });
+          const results = Array.isArray(searchRes.data?.results) ? searchRes.data.results : [];
+          if (results.length > 0) {
+            const context = results
+              .map((r, idx) => `【${idx + 1}】 ${r.chunkText}`)
+              .join('\n\n');
+            knowledgeMessages = [{
+              role: 'system',
+              content: `Use the following retrieved knowledge when answering. If irrelevant, say so. Cite snippets implicitly by content.\n\n${context}`,
+            }];
+          }
+        }
+      } catch (e) {
+        console.warn('RAG retrieval failed', e?.response?.data || e?.message || e);
+      }
+
+      // Get AI response
+      // Send custom prompt both as system message AND as customPrompt field for flexibility
+      const systemMessages = activePersona?.prompt
+        ? [{ role: 'system', content: activePersona.prompt }]
+        : [];
+      
+      // Use last 5 message pairs (10 messages) + current for context efficiency
+      // This maintains conversation memory while saving tokens
+      const lastMessages = updatedMessages.slice(-10); // Last 10 messages (5 pairs)
+      
+      // Stream response using SSE
+      let accumulatedContent = '';
+      const assistantMessageId = `assistant-${Date.now()}`;
+      
+      // Add placeholder message for streaming
+      setMessages([...updatedMessages, { 
+        role: 'assistant', 
+        content: '', 
+        id: assistantMessageId,
+        timestamp: new Date().toISOString(),
+        isTyping: true
+      }]);
+
+      // Use fetch for EventSource-like streaming
+      const response = await fetch('/api/chat/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [...knowledgeMessages, ...systemMessages, ...lastMessages],
+          model: chatModel,
+          temperature,
+          max_tokens: maxTokens,
+          customPrompt: activePersona?.prompt || null,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error('Stream failed to start');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.substring(6));
+              
+              if (data.type === 'token') {
+                accumulatedContent += data.content;
+                
+                // Update the message with accumulated content
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  const lastIndex = newMessages.length - 1;
+                  if (lastIndex >= 0 && newMessages[lastIndex].id === assistantMessageId) {
+                    newMessages[lastIndex] = {
+                      ...newMessages[lastIndex],
+                      content: accumulatedContent,
+                      isTyping: true
+                    };
+                  }
+                  return newMessages;
+                });
+              } else if (data.type === 'done') {
+                // Mark as not typing
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  const lastIndex = newMessages.length - 1;
+                  if (lastIndex >= 0 && newMessages[lastIndex].id === assistantMessageId) {
+                    newMessages[lastIndex] = {
+                      ...newMessages[lastIndex],
+                      isTyping: false
+                    };
+                  }
+                  return newMessages;
+                });
+                
+                // Save to Firestore
+                const assistantTimestamp = new Date().toISOString();
+                const finalChatRef = doc(db, 'chats', threadId);
+                const finalChatDoc = await getDoc(finalChatRef);
+                
+                if (finalChatDoc.exists()) {
+                  const currentMessages = finalChatDoc.data().messages || [];
+                  const updatedMessagesFirestore = [
+                    ...currentMessages,
+                    {
+                      role: 'ai',
+                      text: accumulatedContent,
+                      timestamp: assistantTimestamp,
+                    }
+                  ];
+                  
+                  await updateDoc(finalChatRef, {
+                    messages: updatedMessagesFirestore,
+                    updatedAt: assistantTimestamp,
+                  });
+                }
+                
+                // Track analytics and sources used
+                try { await trackChat(user.uid); } catch (e) { console.warn('trackChat failed', e); }
+                await updateDoc(doc(db, 'threads', threadId), { updatedAt: new Date().toISOString(), sources: selectedFiles.map(f => f.id) });
+                
+                // Mark user message as successful
+                setMessageStatuses(prev => ({ ...prev, [messageId]: 'success' }));
+                setPendingMessageId(null);
+                
+                // Capture total time
+                const totalSecs = Math.max(1, Math.floor((Date.now() - thinkStartRef.current) / 1000));
+                setLastResponseTime(totalSecs);
+                
+                // Save credit deduction to Firestore
+                try {
+                  await deductCredits(user.uid, 1);
+                } catch (err) {
+                  console.error('Error saving credit deduction:', err);
+                }
+              } else if (data.type === 'error') {
+                throw new Error(data.error);
+              }
+            } catch (e) {
+              console.error('Error parsing SSE data:', e);
+            }
+          }
+        }
+      }
+
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        console.log('Request canceled by user');
+        // Remove the streaming message
+        setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
+        return;
+      }
+      console.error('Error sending message:', error);
+      setChatError('Failed to send message. Please try again.');
+      
+      // Remove the streaming message on error
+      setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
+      
+      // Mark user message as error
+      setMessageStatuses(prev => ({ ...prev, [messageId]: 'error' }));
+      setPendingMessageId(null);
+      
+      // Refund credit on error
+      setCredits(originalCredits);
+      try {
+        const currentBalance = await getUserCredits(user.uid);
+        setCredits(currentBalance);
+      } catch (err) {
+        console.error('Error fetching credits:', err);
+      }
+    } finally {
+      setChatLoading(false);
+      setIsTyping(false);
+      setIsGenerating(false);
+      abortControllerRef.current = null;
+      if (thinkTimerRef.current) {
+        clearInterval(thinkTimerRef.current);
+        thinkTimerRef.current = null;
+      }
+        // Clear selected files after send
+        setSelectedFiles([]);
+    }
+  };
+
+  // Handle image generation
+  const handleImageGeneration = async (e) => {
+    e.preventDefault();
+    if (!imagePrompt.trim() || !user) return;
+
+    setImageError('');
+
+    // Check and deduct credits (5 credits per image)
+    const creditResult = await deductCredits(user.uid, 5);
+    if (!creditResult.success) {
+      setImageError(creditResult.message || 'Insufficient credits to generate image. You need 5 credits.');
+      return;
+    }
+    setCredits(creditResult.newBalance);
+
+    setImageLoading(true);
+    setGeneratedImage(null);
+
+    try {
+      const response = await axios.post('/api/image', {
+        prompt: imagePrompt,
+      });
+      if (response.data?.error) {
+        setImageError(response.data.error);
+        return;
+      }
+
+      const newImage = {
+        url: response.data.imageUrl,
+        prompt: imagePrompt,
+        timestamp: new Date().toISOString(),
+      };
+
+             // Save image to Firestore
+      await addDoc(collection(db, 'images'), {
+        userId: user.uid,
+        imageUrl: newImage.url,
+        prompt: newImage.prompt,
+        timestamp: newImage.timestamp,
+      });
+             // Track analytics
+             try { await trackImage(user.uid); } catch (e) { console.warn('trackImage failed', e); }
+
+      setGeneratedImage(newImage);
+      setImagePrompt(''); // Clear the prompt after successful generation
+    } catch (error) {
+      console.error('Error generating image:', error);
+      setImageError('Failed to generate image. Please try again.');
+    } finally {
+      setImageLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen transition-all duration-400 pb-safe" style={{ background: 'var(--bg-gradient)' }}>
+      {/* Skip Link */}
+      <a 
+        href="#main-content" 
+        className="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-[#121620] focus:text-[#e5e7eb] focus:rounded-lg focus:font-medium focus:border focus:border-[#1f2532]"
+      >
+        Skip to main content
+      </a>
+      
+      {/* Modern Top Navigation */}
+      <motion.header
+        initial={{ opacity: 0, y: -20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="sticky top-0 z-50 border-b shadow-sm transition-all duration-400"
+        style={{ 
+          backgroundColor: 'var(--topbar-bg)', 
+          borderColor: 'var(--border-color)',
+          opacity: '0.9'
+        }}
+        role="banner"
+      >
+        <div className="max-w-full mx-auto px-3 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-14 md:h-16">
+            
+            {/* Left: Logo and Menu Toggle */}
+            <div className="flex items-center gap-2 md:gap-4">
+              {/* Mobile Menu Button */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setSidebarOpen(!sidebarOpen)}
+                className="md:hidden p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+              >
+                <Menu className="w-5 h-5" />
+              </motion.button>
+
+              {/* Desktop Sidebar Toggle */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+                className="hidden md:flex p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+              >
+                {sidebarCollapsed ? <ChevronRight className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
+              </motion.button>
+
+              {/* Logo and Brand */}
+              <div className="flex items-center gap-2 md:gap-3">
+                <div className="w-8 h-8 md:w-10 md:h-10 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg">
+                  <Sparkles className="w-4 h-4 md:w-6 md:h-6 text-white" />
+                </div>
+                <div className="hidden sm:block">
+                  <h1 className="text-lg md:text-xl font-bold text-white">Nova AI</h1>
+                  <p className="text-xs text-white/80">Powered by GPT-4</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Center: Current Chat Title */}
+            <div className="flex-1 max-w-md mx-8 hidden sm:block">
+              <div className="text-center">
+                <h2 className="text-lg font-semibold text-white truncate">
+                  {getCurrentChatTitle()}
+                </h2>
+                {activePersona && (
+                  <p className="text-xs text-white/70">
+                    Chatting with {activePersona.name}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Right: Action Buttons */}
+            <div className="flex items-center gap-1 md:gap-2">
+              {/* Credits Display */}
+              {typeof credits === 'number' && (
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => setShowCreditsModal(true)}
+                  className="hidden sm:flex items-center gap-2 px-3 py-2 glass rounded-lg hover:glass-strong transition-all duration-200 text-white"
+                  title="Get more credits"
+                >
+                  <Coins className="w-4 h-4" />
+                  <span className="font-semibold text-sm">{credits}</span>
+                </motion.button>
+              )}
+
+              {/* Theme Toggle */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={toggleTheme}
+                className="p-2 text-white/80 hover:text-white hover:glass rounded-lg transition-all duration-200"
+                title={isDark ? 'Light Mode' : 'Dark Mode'}
+              >
+                {isDark ? (
+                  <svg className="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                  </svg>
+                )}
+              </motion.button>
+
+              {/* Feedback Button */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setShowFeedbackModal(true)}
+                className="p-2 text-white/80 hover:text-white hover:glass rounded-lg transition-all duration-200"
+                title="Report Bug / Feedback"
+              >
+                <Bug className="w-4 h-4 md:w-5 md:h-5" />
+              </motion.button>
+
+              {/* Theme Button */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setIsThemeSelectorOpen(true)}
+                className="p-2 text-white/80 hover:text-white hover:glass rounded-lg transition-all duration-200"
+                title="Change Theme"
+              >
+                <svg className="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z" />
+                </svg>
+              </motion.button>
+
+              {/* Profile Button */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => router.push('/profile')}
+                className="p-2 text-white/80 hover:text-white hover:glass rounded-lg transition-all duration-200"
+                title="View Profile"
+              >
+                <User className="w-4 h-4 md:w-5 md:h-5" />
+              </motion.button>
+
+              {/* Logout Button */}
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={handleLogout}
+                className="px-3 py-2 bg-red-500/90 hover:bg-red-600 text-white rounded-lg font-medium transition-all duration-200 text-sm glass"
+              >
+                <LogOut className="w-4 h-4 sm:hidden" />
+                <span className="hidden sm:inline">Logout</span>
+              </motion.button>
+            </div>
+          </div>
+        </div>
+      </motion.header>
+
+
+      {/* Mobile Sidebar Overlay */}
+      <AnimatePresence>
+        {sidebarOpen && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/50 z-40 md:hidden"
+              onClick={() => setSidebarOpen(false)}
+            />
+            <motion.aside
+              initial={{ x: -320 }}
+              animate={{ x: 0 }}
+              exit={{ x: -320 }}
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="fixed left-0 top-0 h-full w-80 glass-dark shadow-xl z-50 md:hidden flex flex-col"
+            >
+              {/* Mobile Sidebar Content */}
+              <div className="flex items-center justify-between p-4 border-b border-white/20">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg">
+                    <Sparkles className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <span className="font-bold text-white text-lg">Nova AI</span>
+                    <p className="text-xs text-white/60">AI Assistant</p>
+                  </div>
+                </div>
+                <motion.button
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={() => setSidebarOpen(false)}
+                  className="p-2 text-white/60 hover:text-white hover:bg-white/20 rounded-lg transition-all duration-200"
+                >
+                  <X className="w-5 h-5" />
+                </motion.button>
+              </div>
+              
+              {/* Mobile Sidebar Navigation */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                {/* Navigation Items */}
+                <div className="space-y-1">
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => { setActiveTab('chat'); setSidebarOpen(false); }}
+                    className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                      activeTab === 'chat'
+                        ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                        : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+                    }`}
+                  >
+                    <div className={`p-1 rounded-lg ${
+                      activeTab === 'chat' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                    }`}>
+                      <MessageSquare className="w-5 h-5" />
+                    </div>
+                    <span className="font-medium">Chat</span>
+                  </motion.button>
+                  
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => { setActiveTab('image'); setSidebarOpen(false); }}
+                    className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                      activeTab === 'image'
+                        ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                        : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+                    }`}
+                  >
+                    <div className={`p-1 rounded-lg ${
+                      activeTab === 'image' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                    }`}>
+                      <ImageIcon className="w-5 h-5" />
+                    </div>
+                    <span className="font-medium">Images</span>
+                  </motion.button>
+                  
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => { setActiveTab('library'); setSidebarOpen(false); }}
+                    className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                      activeTab === 'library'
+                        ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                        : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+                    }`}
+                  >
+                    <div className={`p-1 rounded-lg ${
+                      activeTab === 'library' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                    }`}>
+                      <Library className="w-5 h-5" />
+                    </div>
+                    <span className="font-medium">Library</span>
+                  </motion.button>
+                  
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => { router.push('/my-ais'); setSidebarOpen(false); }}
+                    className="group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-white/80 hover:text-white hover:bg-white/10 transition-all duration-200 hover:shadow-md"
+                  >
+                    <div className="p-1 rounded-lg group-hover:bg-white/10">
+                      <User className="w-5 h-5" />
+                    </div>
+                    <span className="font-medium">My AIs</span>
+                  </motion.button>
+                  
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => { router.push('/profile'); setSidebarOpen(false); }}
+                    className="group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-white/80 hover:text-white hover:bg-white/10 transition-all duration-200 hover:shadow-md"
+                  >
+                    <div className="p-1 rounded-lg group-hover:bg-white/10">
+                      <Settings className="w-5 h-5" />
+                    </div>
+                    <span className="font-medium">Profile</span>
+                  </motion.button>
+                </div>
+
+                {/* Divider */}
+                <div className="border-t border-white/20 my-4"></div>
+
+                {/* Chat History */}
+                <div>
+                  <div className="flex items-center justify-between px-3 py-2">
+                    <h3 className="text-sm font-semibold text-white">Recent Chats</h3>
+                    <motion.button
+                      whileHover={{ scale: 1.1 }}
+                      whileTap={{ scale: 0.9 }}
+                      onClick={() => { handleNewChat(); setSidebarOpen(false); }}
+                      className="p-2 text-white/60 hover:text-white hover:bg-white/20 rounded-lg transition-all duration-200"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </motion.button>
+                  </div>
+                  
+                  <div className="space-y-1 max-h-60 overflow-y-auto">
+                    {threads.slice(0, 10).map((thread) => (
+                      <motion.button
+                        key={thread.id}
+                        onClick={() => { handleChatSwitch(thread.id); setSidebarOpen(false); }}
+                        whileHover={{ scale: 1.02 }}
+                        whileTap={{ scale: 0.98 }}
+                        className={`group relative w-full text-left px-3 py-2.5 rounded-xl text-sm transition-all duration-200 ${
+                          activeThreadId === thread.id
+                            ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                            : 'hover:bg-white/10 text-white/80 hover:text-white hover:shadow-md'
+                        }`}
+                        title={thread.title || 'New Chat'}
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className={`p-1 rounded-lg ${
+                            activeThreadId === thread.id ? 'bg-white/20' : 'group-hover:bg-white/10'
+                          }`}>
+                            <MessageSquare className="w-4 h-4" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="truncate font-medium">{thread.title || 'New Chat'}</div>
+                            <div className="text-xs text-white/60 flex items-center gap-1">
+                              <Calendar className="w-3 h-3" />
+                              {new Date(thread.updatedAt).toLocaleDateString([], { 
+                                month: 'short', 
+                                day: 'numeric'
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                        
+                        {/* Active indicator */}
+                        {activeThreadId === thread.id && (
+                          <motion.div
+                            initial={{ opacity: 0, scale: 0 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            className="absolute right-2 top-1/2 transform -translate-y-1/2 w-2 h-2 bg-white rounded-full shadow-sm"
+                          />
+                        )}
+                      </motion.button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </motion.aside>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Main Content with Sidebar */}
+      <main id="main-content" className="max-w-full mx-auto px-3 sm:px-6 lg:px-8 py-6 sm:py-8 flex gap-4 sm:gap-6" role="main">
+        {/* Desktop Sidebar */}
+        <motion.aside
+          initial={{ width: 256 }}
+          animate={{ width: sidebarCollapsed ? 64 : 256 }}
+          className="shrink-0 hidden md:flex md:flex-col backdrop-blur-xl rounded-2xl shadow-xl border h-[calc(100vh-180px)] transition-all duration-400 overflow-hidden"
+          style={{ 
+            backgroundColor: 'var(--sidebar-bg)', 
+            borderColor: 'var(--border-color)',
+            opacity: '0.9'
+          }}
+          role="complementary"
+          aria-label="Chat navigation sidebar"
+        >
+          {/* Navigation Header */}
+          <div className="p-4 border-b border-glass">
+            {!sidebarCollapsed ? (
+              <motion.div 
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex items-center gap-3"
+              >
+                <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg">
+                  <Sparkles className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <h2 className="font-bold text-white text-lg">Nova AI</h2>
+                  <p className="text-xs text-white/60">AI Assistant</p>
+                </div>
+              </motion.div>
+            ) : (
+              <div className="flex justify-center">
+                <motion.div 
+                  whileHover={{ scale: 1.05 }}
+                  className="w-10 h-10 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg"
+                >
+                  <Sparkles className="w-6 h-6 text-white" />
+                </motion.div>
+              </div>
+            )}
+          </div>
+
+          {/* Navigation Items */}
+          <div className="px-3 py-2 space-y-1">
+            <motion.button
+              onClick={() => setActiveTab('chat')}
+              whileHover={{ 
+                scale: 1.02,
+                x: sidebarCollapsed ? 0 : 4
+              }}
+              whileTap={{ scale: 0.98 }}
+              className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                activeTab === 'chat'
+                  ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                  : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+              }`}
+              title={sidebarCollapsed ? 'Chat' : ''}
+            >
+              <motion.div
+                animate={{
+                  scale: activeTab === 'chat' ? [1, 1.1, 1] : 1,
+                  rotate: activeTab === 'chat' ? [0, 5, -5, 0] : 0
+                }}
+                transition={{
+                  duration: 0.5,
+                  ease: "easeInOut"
+                }}
+                className={`p-1 rounded-lg ${
+                  activeTab === 'chat' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                }`}
+              >
+                <MessageSquare className="w-5 h-5" />
+              </motion.div>
+              {!sidebarCollapsed && <span className="font-medium">Chat</span>}
+            </motion.button>
+            
+            <motion.button
+              onClick={() => setActiveTab('image')}
+              whileHover={{ 
+                scale: 1.02,
+                x: sidebarCollapsed ? 0 : 4
+              }}
+              whileTap={{ scale: 0.98 }}
+              className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                activeTab === 'image'
+                  ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                  : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+              }`}
+              title={sidebarCollapsed ? 'Image Generator' : ''}
+            >
+              <motion.div
+                animate={{
+                  scale: activeTab === 'image' ? [1, 1.1, 1] : 1,
+                  rotate: activeTab === 'image' ? [0, 5, -5, 0] : 0
+                }}
+                transition={{
+                  duration: 0.5,
+                  ease: "easeInOut"
+                }}
+                className={`p-1 rounded-lg ${
+                  activeTab === 'image' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                }`}
+              >
+                <ImageIcon className="w-5 h-5" />
+              </motion.div>
+              {!sidebarCollapsed && <span className="font-medium">Images</span>}
+            </motion.button>
+            
+            <motion.button
+              onClick={() => setActiveTab('library')}
+              whileHover={{ 
+                scale: 1.02,
+                x: sidebarCollapsed ? 0 : 4
+              }}
+              whileTap={{ scale: 0.98 }}
+              className={`group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${
+                activeTab === 'library'
+                  ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                  : 'text-white/80 hover:text-white hover:bg-white/10 hover:shadow-md'
+              }`}
+              title={sidebarCollapsed ? 'Library' : ''}
+            >
+              <motion.div
+                animate={{
+                  scale: activeTab === 'library' ? [1, 1.1, 1] : 1,
+                  rotate: activeTab === 'library' ? [0, 5, -5, 0] : 0
+                }}
+                transition={{
+                  duration: 0.5,
+                  ease: "easeInOut"
+                }}
+                className={`p-1 rounded-lg ${
+                  activeTab === 'library' ? 'bg-white/20' : 'group-hover:bg-white/10'
+                }`}
+              >
+                <Library className="w-5 h-5" />
+              </motion.div>
+              {!sidebarCollapsed && <span className="font-medium">Library</span>}
+            </motion.button>
+
+            <motion.button
+              onClick={() => router.push('/my-ais')}
+              whileHover={{ 
+                scale: 1.02,
+                x: sidebarCollapsed ? 0 : 4
+              }}
+              whileTap={{ scale: 0.98 }}
+              className="group w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-white/80 hover:text-white hover:bg-white/10 transition-all duration-200 hover:shadow-md"
+              title={sidebarCollapsed ? 'My AIs' : ''}
+            >
+              <div className="p-1 rounded-lg group-hover:bg-white/10">
+                <User className="w-5 h-5" />
+              </div>
+              {!sidebarCollapsed && <span className="font-medium">My AIs</span>}
+            </motion.button>
+          </div>
+
+          {/* Divider */}
+          <div className="mx-3 border-t border-white/20"></div>
+
+          {/* New Chat Button */}
+          <div className="p-3">
+            <motion.button 
+              onClick={handleNewChat}
+              whileHover={{ 
+                scale: 1.05,
+                boxShadow: "0 12px 30px rgba(147, 51, 234, 0.4)"
+              }}
+              whileTap={{ scale: 0.95 }}
+              animate={{
+                boxShadow: [
+                  "0 6px 20px rgba(147, 51, 234, 0.3)",
+                  "0 8px 25px rgba(147, 51, 234, 0.4)",
+                  "0 6px 20px rgba(147, 51, 234, 0.3)"
+                ]
+              }}
+              transition={{
+                duration: 2,
+                repeat: Infinity,
+                ease: "easeInOut"
+              }}
+              className="group w-full flex items-center gap-3 px-4 py-3 text-sm bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-600 hover:to-indigo-700 text-white rounded-xl transition-all duration-200 shadow-lg backdrop-blur-sm"
+              title={sidebarCollapsed ? 'New Chat' : ''}
+            >
+              <motion.div
+                animate={{
+                  rotate: [0, 180, 360],
+                  scale: [1, 1.1, 1]
+                }}
+                transition={{
+                  duration: 2,
+                  repeat: Infinity,
+                  ease: "easeInOut"
+                }}
+                className="p-1 rounded-lg bg-white/20"
+              >
+                <Plus className="w-5 h-5" />
+              </motion.div>
+              {!sidebarCollapsed && <span className="font-semibold">New Chat</span>}
+            </motion.button>
+          </div>
+
+          {/* Search Chats */}
+          {!sidebarCollapsed && (
+            <div className="px-3 py-2 border-t border-[#1f2532]">
+              <div className="relative">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-[#9ca3af]" />
+                <input
+                  type="text"
+                  placeholder="Search chats"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full pl-10 pr-3 py-2.5 text-sm bg-[#1a1f29] text-[#e5e7eb] placeholder-[#9ca3af] border-0 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#8b5cf6] focus:bg-[#121620] transition-all duration-200"
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Threads List */}
+          {!sidebarCollapsed && (
+            <div className="overflow-y-auto p-2 space-y-1 flex-1">
+              {threads.filter(t => 
+                !searchQuery || (t.title || 'New Chat').toLowerCase().includes(searchQuery.toLowerCase())
+              ).length === 0 ? (
+                <div className="text-xs text-[#9ca3af] p-2">
+                  {searchQuery ? 'No matching chats' : 'No chats yet'}
+                </div>
+              ) : (
+                threads
+                  .filter(t => 
+                    !searchQuery || (t.title || 'New Chat').toLowerCase().includes(searchQuery.toLowerCase())
+                  )
+                  .map((t) => (
+                    <div
+                      key={t.id}
+                      className="relative group"
+                      onMouseEnter={() => setHoveredThread(t.id)}
+                      onMouseLeave={() => setHoveredThread(null)}
+                    >
+                      {editingThread === t.id ? (
+                        <div className="px-3 py-2">
+                          <input
+                            type="text"
+                            value={editTitle}
+                            onChange={(e) => setEditTitle(e.target.value)}
+                            onBlur={() => {
+                              if (editTitle.trim()) {
+                                handleRenameThread(t.id, editTitle);
+                              } else {
+                                setEditingThread(null);
+                                setEditTitle('');
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                if (editTitle.trim()) {
+                                  handleRenameThread(t.id, editTitle);
+                                }
+                              } else if (e.key === 'Escape') {
+                                setEditingThread(null);
+                                setEditTitle('');
+                              }
+                            }}
+                            className="w-full px-2 py-1 text-sm bg-white dark:bg-gray-600 text-gray-900 dark:text-white border border-gray-300 dark:border-gray-500 rounded focus:outline-none focus:ring-2 focus:ring-primary-500"
+                            autoFocus
+                          />
+                        </div>
+                      ) : (
+                        <>
+                          <motion.button
+                            onClick={() => handleChatSwitch(t.id)}
+                            whileHover={{ 
+                              scale: 1.02,
+                              x: 4
+                            }}
+                            whileTap={{ scale: 0.98 }}
+                            className={`group relative w-full text-left px-3 py-2.5 rounded-xl text-sm transition-all duration-200 ${
+                              activeThreadId === t.id
+                                ? 'bg-white/20 text-white shadow-lg backdrop-blur-sm'
+                                : 'hover:bg-white/10 text-white/80 hover:text-white hover:shadow-md'
+                            }`}
+                            title={t.title || 'New Chat'} // Tooltip for full title
+                          >
+                            <div className="flex items-center gap-3">
+                              <div className={`p-1 rounded-lg ${
+                                activeThreadId === t.id ? 'bg-white/20' : 'group-hover:bg-white/10'
+                              }`}>
+                                <MessageSquare className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="truncate pr-8 font-medium">{t.title || 'New Chat'}</div>
+                                <div className="text-xs text-white/60 flex items-center gap-1">
+                                  <Calendar className="w-3 h-3" />
+                                  {new Date(t.updatedAt).toLocaleDateString([], { 
+                                    month: 'short', 
+                                    day: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit'
+                                  })}
+                                </div>
+                              </div>
+                            </div>
+                            
+                            {/* Active indicator */}
+                            {activeThreadId === t.id && (
+                              <motion.div
+                                initial={{ opacity: 0, scale: 0 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                className="absolute right-2 top-1/2 transform -translate-y-1/2 w-2 h-2 bg-white rounded-full shadow-sm"
+                              />
+                            )}
+                          </motion.button>
+                          
+                          {/* Three dots menu - only show on hover */}
+                          {hoveredThread === t.id && (
+                            <div className="absolute right-2 top-1/2 transform -translate-y-1/2">
+                              <div className="relative">
+                                <motion.button
+                                  whileHover={{ scale: 1.1 }}
+                                  whileTap={{ scale: 0.9 }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setShowMenu(showMenu === t.id ? null : t.id);
+                                  }}
+                                  className="p-1.5 text-white/60 hover:text-white hover:bg-white/20 rounded-lg transition-all duration-200"
+                                >
+                                  <MoreVertical className="w-4 h-4" />
+                                </motion.button>
+                                
+                                {/* Dropdown menu */}
+                                {showMenu === t.id && (
+                                  <motion.div
+                                    initial={{ opacity: 0, scale: 0.95, y: -10 }}
+                                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                                    exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                                    className="absolute right-0 top-full mt-1 w-36 glass border-glass rounded-xl shadow-lg py-2 z-10"
+                                  >
+                                    <motion.button
+                                      whileHover={{ scale: 1.02 }}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setEditingThread(t.id);
+                                        setEditTitle(t.title || 'New Chat');
+                                        setShowMenu(null);
+                                      }}
+                                      className="w-full text-left px-3 py-2 text-sm text-white/80 hover:text-white hover:bg-white/10 flex items-center gap-2 transition-all duration-200"
+                                    >
+                                      <Edit3 className="w-4 h-4" />
+                                      Rename
+                                    </motion.button>
+                                    <motion.button
+                                      whileHover={{ scale: 1.02 }}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        confirmDeleteThread(t);
+                                        setShowMenu(null);
+                                      }}
+                                      className="w-full text-left px-3 py-2 text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 flex items-center gap-2 transition-all duration-200"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                      Delete
+                                    </motion.button>
+                                  </motion.div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  ))
+              )}
+            </div>
+          )}
+        </motion.aside>
+        {/* Main Content Area */}
+        <div className="flex-1 min-w-0">
+          {activeTab === 'chat' ? (
+            // Modern Chat Interface
+            <div className="relative w-full h-[calc(100vh-140px)] md:h-[calc(100vh-180px)] overflow-hidden backdrop-blur-xl rounded-none md:rounded-2xl shadow-xl border transition-all duration-400" style={{ 
+              backgroundColor: 'var(--glass-bg)', 
+              borderColor: 'var(--border-color)'
+            }}>
+            {/* Background with subtle gradient overlay */}
+            <div className="absolute inset-0 bg-gradient-to-br from-white/10 via-white/5 to-purple-500/10 rounded-xl"></div>
+            
+            {/* Main Chat Container */}
+            <div className="relative h-full flex flex-col">
+              {/* Persona Banner */}
+              <AnimatePresence>
+                {activePersona && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="glass-strong border-b border-glass p-4 mx-4 mt-4 rounded-lg"
+                  >
+                    <div className="flex items-center gap-3 max-w-4xl mx-auto">
+                      {activePersona.avatar && (
+                        <img 
+                          src={activePersona.avatar} 
+                          alt={activePersona.name} 
+                          className="w-8 h-8 rounded-full object-cover ring-2 ring-primary-200 dark:ring-primary-700" 
+                        />
+                      )}
+                      <div className="flex-1">
+                        <span className="text-sm font-medium text-primary-700 dark:text-primary-300">
+                          {activePersona.name}
+                        </span>
+                        <p className="text-xs text-primary-600 dark:text-primary-400">
+                          Custom AI persona active
+                        </p>
+                      </div>
+                      <motion.button
+                        whileHover={{ scale: 1.05 }}
+                        whileTap={{ scale: 0.95 }}
+                        onClick={() => {
+                          const q = { ...router.query };
+                          delete q.persona;
+                          router.push({ pathname: '/dashboard', query: q });
+                        }}
+                        className="px-3 py-1 text-xs font-medium text-primary-600 dark:text-primary-400 hover:text-primary-700 dark:hover:text-primary-300 bg-primary-100 dark:bg-primary-900/30 rounded-full transition-colors"
+                      >
+                        Remove
+                      </motion.button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Messages Container */}
+                <div 
+                  className="flex-1 overflow-y-auto px-6 py-6"
+                  role="log"
+                  aria-label="Chat messages"
+                  aria-live="polite"
+                  aria-atomic="false"
+                >
+                <div className="max-w-4xl mx-auto space-y-6">
+                  {/* Chat switching loader */}
+                  {switchingChat && (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex items-center justify-center py-8"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="w-6 h-6 border-2 border-primary-500 border-t-transparent rounded-full animate-spin" />
+                        <span className="text-sm text-[#9ca3af]">Loading chat...</span>
+                      </div>
+                    </motion.div>
+                  )}
+                  {messages.length === 0 ? (
+                    <motion.div
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.6 }}
+                      className="text-center py-12 md:py-20 flex flex-col items-center justify-center h-full"
+                    >
+                      <div className="w-12 h-12 md:w-16 md:h-16 mx-auto mb-4 md:mb-6 bg-gradient-to-br from-primary-500 to-purple-500 rounded-2xl flex items-center justify-center">
+                        <svg className="w-6 h-6 md:w-8 md:h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                      </div>
+                      <h3 className="text-lg md:text-xl font-semibold text-[#e5e7eb] mb-2">
+                        Start a conversation with AI
+                      </h3>
+                      <p className="text-sm md:text-base text-[#9ca3af] mb-6 md:mb-8">
+                        Ask anything you'd like to know!
+                      </p>
+                      <motion.button
+                        whileHover={{ scale: 1.02 }}
+                        whileTap={{ scale: 0.98 }}
+                        onClick={() => setShowChatTemplates(!showChatTemplates)}
+                        className="inline-flex items-center gap-2 px-4 md:px-6 py-2 md:py-3 bg-gradient-to-r from-primary-600 to-purple-600 text-white font-medium rounded-xl hover:shadow-lg transition-all duration-200 text-sm md:text-base w-4/5 max-w-sm"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                        </svg>
+                        {showChatTemplates ? 'Hide Templates' : 'Browse Templates'}
+                      </motion.button>
+                      
+                      <AnimatePresence>
+                        {showChatTemplates && (
+                          <motion.div
+                            initial={{ opacity: 0, y: 20 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -20 }}
+                            transition={{ duration: 0.3 }}
+                            className="mt-4 md:mt-8 grid grid-cols-1 gap-3 md:gap-4 w-full max-w-sm md:max-w-none"
+                          >
+                            {chatTemplates.map((template, index) => (
+                              <motion.button
+                                key={template.id}
+                                initial={{ opacity: 0, y: 20 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                transition={{ duration: 0.3, delay: index * 0.1 }}
+                                whileHover={{ scale: 1.02, y: -2 }}
+                                whileTap={{ scale: 0.98 }}
+                                onClick={() => {
+                                  setChatInput(template.prompt);
+                                  setShowChatTemplates(false);
+                                }}
+                                className="text-left p-4 bg-[#121620] rounded-xl border border-[#1f2532] hover:border-[#8b5cf6] hover:shadow-md transition-all duration-200 group"
+                              >
+                                <div className="font-medium text-[#e5e7eb] mb-2 group-hover:text-[#8b5cf6] transition-colors">
+                                  {template.title}
+                                </div>
+                                <div className="text-sm text-[#9ca3af] leading-relaxed">
+                                  {template.description}
+                                </div>
+                              </motion.button>
+                            ))}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </motion.div>
+                  ) : (
+                    <AnimatePresence>
+                      {messages.map((message, index) => (
+                        <motion.div
+                          key={index}
+                          initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          transition={{ 
+                            duration: 0.5,
+                            delay: index * 0.05,
+                            type: "spring",
+                            stiffness: 400,
+                            damping: 25
+                          }}
+                          className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'} group`}
+                          role="article"
+                          aria-label={`${message.role === 'user' ? 'Your message' : 'AI response'} ${index + 1}`}
+                          tabIndex={0}
+                        >
+                          <div className={`flex items-start gap-3 max-w-[90%] sm:max-w-[85%] md:max-w-[80%] ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                            {/* Avatar */}
+                            <div 
+                              className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center shadow-sm ${
+                                message.role === 'user' 
+                                  ? 'bg-gradient-to-br from-blue-500 to-indigo-600' 
+                                  : 'bg-gradient-to-br from-slate-400 to-slate-500 dark:from-slate-600 dark:to-slate-700'
+                              }`}
+                              role="img"
+                              aria-label={message.role === 'user' ? 'User avatar' : 'AI assistant avatar'}
+                            >
+                              {message.role === 'user' ? (
+                                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                                </svg>
+                              ) : (
+                                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                                </svg>
+                              )}
+                            </div>
+
+                            {/* Message Bubble */}
+                            <div className="flex flex-col gap-1">
+                              <div
+                                className={`relative px-5 py-4 rounded-2xl shadow-lg group/message transition-all duration-400 hover:shadow-xl ${
+                                  message.role === 'user'
+                                    ? 'text-white rounded-br-md'
+                                    : 'rounded-bl-md border'
+                                }`}
+                                style={message.role === 'user' 
+                                  ? { 
+                                      background: 'var(--chat-bubble-user)',
+                                      boxShadow: 'var(--shadow-color) 0 4px 12px'
+                                    }
+                                  : {
+                                      backgroundColor: 'var(--chat-bubble-ai)',
+                                      color: 'var(--text-primary)',
+                                      borderColor: 'var(--border-color)'
+                                    }
+                                }
+                                role="textbox"
+                                aria-label={`Message content: ${message.content.substring(0, 100)}${message.content.length > 100 ? '...' : ''}`}
+                              >
+                                {message.role === 'user' ? (
+                                  <p className="whitespace-pre-wrap leading-relaxed pr-12 text-base font-medium">{message.content}</p>
+                                ) : message.isTyping ? (
+                                  <div className="pr-12" aria-live="polite" aria-atomic="false">
+                                    <div className="prose prose-base max-w-none prose-headings:text-[#e5e7eb] prose-headings:font-semibold prose-p:text-[#e5e7eb] prose-p:font-normal prose-code:text-[#e5e7eb] prose-code:bg-[#1f2532] prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-[#121620] prose-pre:text-[#e5e7eb] prose-pre:border prose-pre:border-[#1f2532]">
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                                    </div>
+                                    {/* Streaming cursor */}
+                                    <motion.span
+                                      className="inline-block w-2 h-5 bg-[#8b5cf6] ml-1 vertical-align-middle"
+                                      animate={{ opacity: [0, 1, 0] }}
+                                      transition={{ duration: 0.8, repeat: Infinity }}
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="prose prose-base max-w-none prose-headings:text-[#e5e7eb] prose-headings:font-semibold prose-p:text-[#e5e7eb] prose-p:font-normal prose-code:text-[#e5e7eb] prose-code:bg-[#1f2532] prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-pre:bg-[#121620] prose-pre:text-[#e5e7eb] prose-pre:border prose-pre:border-[#1f2532] pr-12">
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                                  </div>
+                                )}
+                                
+                                {/* Copy Button */}
+                                <motion.button
+                                  onClick={() => copyMessage(message.content, `${activeThreadId}-${index}`)}
+                                  whileHover={{ scale: 1.1 }}
+                                  whileTap={{ scale: 0.9 }}
+                                  className={`absolute top-3 right-3 p-2 rounded-lg opacity-0 group-hover/message:opacity-100 transition-all duration-200 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-blue-400/50 hover:scale-110 ${
+                                    message.role === 'user'
+                                      ? 'bg-white/20 hover:bg-white/30 text-white backdrop-blur-sm'
+                                      : 'bg-slate-100/80 dark:bg-slate-600/80 hover:bg-slate-200/80 dark:hover:bg-slate-500/80 text-slate-600 dark:text-slate-300 backdrop-blur-sm'
+                                  }`}
+                                  title="Copy message"
+                                  aria-label={`Copy ${message.role === 'user' ? 'your' : 'AI'} message`}
+                                  tabIndex={0}
+                                >
+                                  <AnimatePresence mode="wait">
+                                    {copiedMessageId === `${activeThreadId}-${index}` ? (
+                                      <motion.div
+                                        key="check"
+                                        initial={{ scale: 0, rotate: -180 }}
+                                        animate={{ scale: 1, rotate: 0 }}
+                                        exit={{ scale: 0, rotate: 180 }}
+                                        transition={{ duration: 0.2 }}
+                                      >
+                                        <Check className="w-4 h-4" />
+                                      </motion.div>
+                                    ) : (
+                                      <motion.div
+                                        key="clipboard"
+                                        initial={{ scale: 1, rotate: 0 }}
+                                        animate={{ scale: 1, rotate: 0 }}
+                                        exit={{ scale: 0, rotate: -180 }}
+                                        transition={{ duration: 0.2 }}
+                                      >
+                                        <Clipboard className="w-4 h-4" />
+                                      </motion.div>
+                                    )}
+                                  </AnimatePresence>
+                                </motion.button>
+                              </div>
+                              
+                              {/* Regenerate and Stop buttons for AI messages */}
+                              {message.role === 'assistant' && !message.isTyping && (
+                                <div className="flex items-center gap-2 mt-2">
+                                  <motion.button
+                                    onClick={() => handleRegenerateResponse(index)}
+                                    whileHover={{ scale: 1.05 }}
+                                    whileTap={{ scale: 0.95 }}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100/80 dark:bg-slate-600/80 hover:bg-slate-200/80 dark:hover:bg-slate-500/80 text-slate-700 dark:text-slate-300 text-sm font-medium transition-all duration-200 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-400/50"
+                                    aria-label="Regenerate response"
+                                  >
+                                    <RotateCcw className="w-3.5 h-3.5" />
+                                    <span className="hidden sm:inline">Regenerate</span>
+                                  </motion.button>
+                                </div>
+                              )}
+                              
+                              {/* Stop generating button (shown when generating) */}
+                              {isGenerating && message.isTyping && (
+                                <div className="flex items-center gap-2 mt-2">
+                                  <motion.button
+                                    onClick={handleStopGeneration}
+                                    whileHover={{ scale: 1.05 }}
+                                    whileTap={{ scale: 0.95 }}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-100/80 dark:bg-red-600/80 hover:bg-red-200/80 dark:hover:bg-red-500/80 text-red-700 dark:text-red-300 text-sm font-medium transition-all duration-200 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-red-400/50"
+                                    aria-label="Stop generating"
+                                  >
+                                    <Square className="w-3.5 h-3.5" />
+                                    <span className="hidden sm:inline">Stop generating</span>
+                                  </motion.button>
+                                </div>
+                              )}
+                              
+                              {/* Timestamp and Status */}
+                              <div className={`text-sm px-2 flex items-center gap-2 ${
+                                message.role === 'user' ? 'text-right justify-end' : 'text-left justify-start'
+                              }`}>
+                                <motion.span
+                                  key={`${message.timestamp}-${timestampRefresh}`}
+                                  className={`text-xs font-medium transition-all duration-200 cursor-help focus:outline-none focus:ring-2 focus:ring-blue-400/50 focus:rounded px-2 py-1 rounded-md ${
+                                    message.role === 'user' 
+                                      ? 'text-white/70 hover:text-white/90 hover:bg-white/10' 
+                                      : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300 hover:bg-slate-100/50 dark:hover:bg-slate-600/30'
+                                  }`}
+                                  title={formatFullTimestamp(message.timestamp)}
+                                  whileHover={{ scale: 1.05 }}
+                                  initial={{ opacity: 0.6 }}
+                                  animate={{ opacity: 1 }}
+                                  transition={{ duration: 0.2 }}
+                                  tabIndex={0}
+                                  role="text"
+                                  aria-label={`Message sent at ${formatFullTimestamp(message.timestamp)}`}
+                                >
+                                  {formatTimestamp(message.timestamp)}
+                                </motion.span>
+                                
+                                {/* Status Indicator for User Messages */}
+                                {message.role === 'user' && message.id && (
+                                  <MessageStatusIndicator
+                                    status={messageStatuses[message.id] || 'success'}
+                                    messageId={message.id}
+                                    onRetry={() => retryMessage(message.id)}
+                                  />
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Share Button */}
+                            {message.role === 'assistant' && index > 0 && (
+                              <div className="opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                                <ShareButton
+                                  type="chat"
+                                  userId={user.uid}
+                                  message={messages[index - 1]?.content || ''}
+                                  response={message.content}
+                                  model={chatModel}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  )}
+
+                  {/* Enhanced Loading Animation */}
+                  <AnimatePresence>
+                    {chatLoading && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: -20, scale: 0.95 }}
+                        className="flex justify-start"
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-gray-400 to-gray-500 dark:from-gray-600 dark:to-gray-700 flex items-center justify-center">
+                            <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                            </svg>
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            <div className="glass border-glass rounded-2xl rounded-bl-md px-4 py-3 shadow-lg">
+                              <TypingAnimation />
+                              {thinkElapsed > 0 && (
+                                <div className="text-xs text-white/70 mt-1">
+                                  Processing for {thinkElapsed}s...
+                                </div>
+                              )}
+                            </div>
+                            {/* Stop button during generation */}
+                            {isGenerating && (
+                              <motion.button
+                                onClick={handleStopGeneration}
+                                whileHover={{ scale: 1.05 }}
+                                whileTap={{ scale: 0.95 }}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-100/80 dark:bg-red-600/80 hover:bg-red-200/80 dark:hover:bg-red-500/80 text-red-700 dark:text-red-300 text-sm font-medium transition-all duration-200 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-red-400/50 self-start"
+                                aria-label="Stop generating"
+                              >
+                                <Square className="w-3.5 h-3.5" />
+                                <span className="hidden sm:inline">Stop generating</span>
+                              </motion.button>
+                            )}
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  {/* Response Time */}
+                  {lastResponseTime !== null && !chatLoading && !chatError && (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="flex justify-start"
+                    >
+                      <div className="text-xs text-white/70 px-2">
+                        ✓ Replied in {lastResponseTime}s
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {/* Error Message */}
+                  <AnimatePresence>
+                    {chatError && (
+                      <motion.div
+                        initial={{ opacity: 0, scale: 0.95 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4"
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-100 dark:bg-red-900/50 flex items-center justify-center">
+                            <svg className="w-3 h-3 text-red-600 dark:text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                            </svg>
+                          </div>
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-red-800 dark:text-red-200 mb-1">Error</p>
+                            <p className="text-sm text-red-700 dark:text-red-300">{chatError}</p>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                  
+                  {/* Scroll anchor */}
+                  <div ref={messagesEndRef} />
+                </div>
+              </div>
+
+              {/* Sticky Input Area */}
+              <div className="border-t border-[#1f2532] bg-transparent">
+                <div className="max-w-4xl mx-auto p-4 space-y-4">
+                  {/* AI Persona & Controls */}
+                  <div className="flex flex-col md:flex-row md:flex-wrap items-start md:items-center gap-2 md:gap-4 text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#9ca3af] font-medium hidden sm:inline">AI:</span>
+                      <select
+                        value={activePersona?.id || ''}
+                        onChange={(e) => {
+                          const personaId = e.target.value;
+                          if (!personaId) {
+                            setActivePersona(null);
+                          } else {
+                            const found = availablePersonas.find(p => p.id === personaId);
+                            if (found) {
+                              setActivePersona(found);
+                            }
+                          }
+                        }}
+                        className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                      >
+                        <option value="">Default AI</option>
+                        {availablePersonas.map((persona) => (
+                          <option key={persona.id} value={persona.id}>
+                            {persona.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#9ca3af] font-medium hidden sm:inline">Model:</span>
+                      <select
+                        value={chatModel}
+                        onChange={(e) => {
+                          setChatModel(e.target.value);
+                          try { localStorage.setItem('chat:model', e.target.value); } catch {}
+                        }}
+                        className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                      >
+                        <option value="gpt-4o-mini">gpt-4o-mini</option>
+                        <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+                        <option value="gpt-4o">gpt-4o</option>
+                        <option value="gpt-4">gpt-4</option>
+                      </select>
+                    </div>
+                    
+                    <div className="flex items-center gap-2 hidden md:flex">
+                      <span className="text-[#9ca3af] font-medium">Temp:</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={2}
+                        step={0.1}
+                        value={temperature}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          setTemperature(v);
+                          try { localStorage.setItem('chat:temperature', String(v)); } catch {}
+                        }}
+                        className="w-20 h-1 bg-[#1f2532] rounded-lg appearance-none cursor-pointer slider"
+                      />
+                      <span className="text-xs text-[#9ca3af] w-8 text-center">{temperature.toFixed(1)}</span>
+                    </div>
+                    
+                    <div className="flex items-center gap-2 hidden md:flex">
+                      <span className="text-[#9ca3af] font-medium">Tokens:</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={4000}
+                        value={maxTokens}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value || '0', 10);
+                          setMaxTokens(Number.isNaN(v) ? 1 : v);
+                          try { localStorage.setItem('chat:maxTokens', String(v)); } catch {}
+                        }}
+                        className="w-16 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Input Form */}
+                  <form onSubmit={handleChatSubmit} className="relative px-4 md:px-6 pb-4 md:pb-6 bg-transparent transition-all duration-400" role="form" aria-label="Chat message form">
+                    <div className="max-w-4xl mx-auto">
+                      {/* Refined Input Container */}
+                      <motion.div
+                        className="relative flex items-end gap-2 md:gap-3 px-3 md:px-4 py-3 rounded-xl md:rounded-2xl border transition-all duration-200 bg-[#121620] border-[#1f2532] text-[#e5e7eb] shadow-[0_2px_8px_rgba(0,0,0,0.3)]"
+                        whileFocus={{
+                          ring: '1px',
+                          ringColor: 'rgba(139, 92, 246, 0.4)'
+                        }}
+                        onDragOver={(e) => { e.preventDefault(); }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          const files = Array.from(e.dataTransfer.files || []);
+                          if (files.length > 0) {
+                            handleFileUpload(files);
+                          }
+                        }}
+                      >
+                        {/* Left Side - File Upload Button */}
+                        <label htmlFor="file-upload" className="cursor-pointer">
+                          <motion.button
+                            type="button"
+                            className="flex-shrink-0 p-2 rounded-lg transition-all duration-200 text-zinc-400 hover:text-[#c4b5fd] min-h-[44px] min-w-[44px] flex items-center justify-center"
+                            whileHover={{ 
+                              scale: 1.1, 
+                              y: -1
+                            }}
+                            whileTap={{ scale: 0.95 }}
+                            title="Upload file (PDF, DOCX, TXT, MD)"
+                          >
+                            <Paperclip className="w-4 h-4 md:w-5 md:h-5" />
+                          </motion.button>
+                        </label>
+                        <input
+                          id="file-upload"
+                          type="file"
+                          accept=".pdf,.docx,.doc,.txt,.md"
+                          multiple
+                          className="hidden"
+                          ref={fileInputRef}
+                          onChange={(e) => {
+                            const files = Array.from(e.target.files);
+                            if (files.length > 0) {
+                              handleFileUpload(files);
+                            }
+                          }}
+                          disabled={uploadLoading}
+                        />
+
+                        {/* Center - Text Input */}
+                        <div className="flex-1 relative">
+                          <label htmlFor="chat-input" className="sr-only">
+                            Type your message
+                          </label>
+                          <motion.textarea
+                            id="chat-input"
+                            value={chatInput}
+                            onChange={(e) => {
+                              setChatInput(e.target.value);
+                              // Auto-resize with max 5 lines
+                              const textarea = e.target;
+                              textarea.style.height = 'auto';
+                              const maxHeight = 5 * 24; // 5 lines * 24px line height
+                              textarea.style.height = Math.min(textarea.scrollHeight, maxHeight) + 'px';
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                if (!chatLoading && credits >= 1) {
+                                  handleChatSubmit(e);
+                                }
+                              }
+                              if (e.key === 'Escape') {
+                                e.target.blur();
+                              }
+                            }}
+                            placeholder="Message Nova AI..."
+                            disabled={(chatLoading || credits < 1 || uploadLoading) && selectedFiles.length === 0}
+                            className="w-full resize-none border-0 outline-none bg-transparent text-[#e5e7eb] placeholder:text-[#9ca3af] text-sm md:text-base"
+                            style={{
+                              fontSize: '16px',
+                              lineHeight: '24px',
+                              minHeight: '24px',
+                              maxHeight: '120px' // 5 lines
+                            }}
+                            aria-describedby="char-count chat-instructions"
+                            aria-invalid={chatInput.length > 2000}
+                            maxLength={2000}
+                            aria-label="Type your message"
+                            rows={1}
+                          />
+                          {uploadLoading && (
+                            <div className="absolute left-0 right-0 -bottom-2 h-1 bg-[#1f2532] rounded">
+                              <div
+                                className="h-1 bg-[#8b5cf6] rounded"
+                                style={{ width: `${Math.max(5, uploadProgress)}%` }}
+                                aria-label="Upload progress"
+                                aria-valuemin={0}
+                                aria-valuemax={100}
+                                aria-valuenow={uploadProgress}
+                                role="progressbar"
+                              />
+                            </div>
+                          )}
+                          {/* Selected file chips */}
+                          {selectedFiles.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-2" aria-label="Attached files">
+                              {selectedFiles.map((f, i) => (
+                                <div key={`${f.id}-${i}`} className="flex items-center gap-2 px-2 py-1 rounded-md border border-[#1f2532] bg-[#0f141e] text-xs">
+                                  <span className="max-w-[160px] truncate" title={f.name}>{f.name}</span>
+                                  <button
+                                    type="button"
+                                    className="px-1 py-0.5 rounded hover:bg-[#1f2532]"
+                                    onClick={() => setSelectedFiles(prev => prev.filter((x) => x !== f))}
+                                    aria-label={`Remove ${f.name}`}
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <div id="char-count" className="absolute bottom-0 right-0 text-xs text-[#9ca3af]" aria-live="polite">
+                            {chatInput.length}/2000
+                          </div>
+                          <div id="chat-instructions" className="sr-only">
+                            Press Enter to send message, Shift+Enter for new line, Escape to blur input
+                          </div>
+                        </div>
+
+                        {/* Right Side - Action Buttons */}
+                        <div className="flex items-center gap-1 md:gap-2">
+                          {/* Voice Input Button */}
+                          <motion.button
+                            type="button"
+                            className="flex-shrink-0 p-2 rounded-lg transition-all duration-200 text-zinc-400 hover:text-[#c4b5fd] min-h-[44px] min-w-[44px] flex items-center justify-center"
+                            whileHover={{ 
+                              scale: 1.1, 
+                              y: -1
+                            }}
+                            whileTap={{ scale: 0.95 }}
+                            title="Voice input (coming soon)"
+                          >
+                            <Mic className="w-4 h-4 md:w-5 md:h-5" />
+                          </motion.button>
+
+                          {/* Send Button */}
+                          <motion.button
+                            type="submit"
+                            disabled={(chatInput.trim().length === 0 && selectedFiles.length === 0) || chatLoading || credits < 1 || uploadLoading}
+                            className={`flex items-center justify-center w-10 h-10 md:w-12 md:h-12 rounded-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${
+                              (chatInput.trim() || selectedFiles.length > 0)
+                                ? 'bg-[#1a1f29] hover:ring-1 hover:ring-[#8b5cf6]/40' 
+                                : 'bg-[#6b7280]'
+                            }`}
+                            whileHover={chatInput.trim() ? { 
+                              scale: 1.1, 
+                              y: -1
+                            } : {}}
+                            whileTap={{ scale: 0.95 }}
+                            aria-label={chatLoading ? "Sending message..." : "Send message"}
+                            aria-describedby="send-button-description"
+                          >
+                            <AnimatePresence mode="wait">
+                              {chatLoading ? (
+                                <motion.div
+                                  key="loading"
+                                  initial={{ opacity: 0, rotate: -180 }}
+                                  animate={{ opacity: 1, rotate: 0 }}
+                                  exit={{ opacity: 0, rotate: 180 }}
+                                  transition={{ duration: 0.3 }}
+                                  className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"
+                                />
+                              ) : (
+                                <motion.div
+                                  key="send"
+                                  initial={{ opacity: 0, rotate: -180 }}
+                                  animate={{ opacity: 1, rotate: 0 }}
+                                  exit={{ opacity: 0, rotate: 180 }}
+                                  transition={{ duration: 0.3 }}
+                                >
+                                  <Send className="w-4 h-4" />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </motion.button>
+                        </div>
+                      </motion.div>
+
+                      {/* Helper Text */}
+                      <div className="mt-3 flex flex-col md:flex-row md:items-center md:justify-between text-xs bg-transparent text-[#9ca3af] gap-1 md:gap-0">
+                        <div className="flex items-center justify-center md:justify-start gap-2 md:gap-4">
+                          <span>Enter to send</span>
+                          <span className="hidden sm:inline">Shift+Enter for new line</span>
+                        </div>
+                        <span className="font-medium text-[#8b5cf6]/90 text-center md:text-right">
+                          1 credit per message
+                        </span>
+                      </div>
+
+                      <div id="send-button-description" className="sr-only">
+                        Send your message. Disabled when no text or insufficient credits.
+                      </div>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : activeTab === 'library' ? (
+          // Library Interface - All Images
+          <div className="bg-[#121620] rounded-lg shadow-md h-[calc(100vh-250px)] flex flex-col transition-colors duration-200 flex-1">
+            <div className="p-6 border-b border-[#1f2532]">
+              <h2 className="text-xl font-semibold text-[#e5e7eb]">Image Library</h2>
+              <p className="text-sm text-[#9ca3af] mt-1">All your generated images</p>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6">
+              {imageHistory.length === 0 ? (
+                <div className="text-center text-[#9ca3af] mt-20">
+                  <svg className="w-16 h-16 mx-auto mb-4 text-[#6b7280]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  <p className="text-lg text-[#e5e7eb]">No images generated yet</p>
+                  <p className="text-sm mt-2 text-[#9ca3af]">Create your first image in the Generate Images tab</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {imageHistory.map((image, index) => (
+                    <motion.div
+                      key={index}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: index * 0.05 }}
+                      whileHover={{ y: -4, transition: { duration: 0.2 } }}
+                      className="bg-gray-50 dark:bg-gray-700 rounded-lg overflow-hidden hover:shadow-xl transition-all duration-200"
+                    >
+                      <div className="relative group">
+                        <img
+                          src={image.url}
+                          alt={image.prompt}
+                          className="w-full h-48 object-cover"
+                        />
+                        <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-10 transition-opacity duration-200"></div>
+                      </div>
+                      <div className="p-3">
+                        <p className="text-xs text-[#9ca3af] mb-1">Prompt:</p>
+                        <p className="text-sm text-[#e5e7eb] line-clamp-2">{image.prompt}</p>
+                        <div className="flex justify-between items-center mt-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-[#9ca3af]">
+                              {new Date(image.timestamp).toLocaleDateString()}
+                            </span>
+                            <ShareButton
+                              type="image"
+                              userId={user.uid}
+                              prompt={image.prompt}
+                              imageUrl={image.url}
+                            />
+                          </div>
+                          <motion.a
+                            href={image.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            whileHover={{ scale: 1.05 }}
+                            className="text-xs text-primary-600 dark:text-primary-400 hover:underline font-medium"
+                          >
+                            Open
+                          </motion.a>
+                        </div>
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          // Image Generation Interface
+          <div className="space-y-6">
+            {/* Generation Form */}
+            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 transition-colors duration-200">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+                  Generate AI Images with DALL-E 3
+                </h2>
+                <button
+                  onClick={() => setShowImageTemplates(!showImageTemplates)}
+                  className="text-sm px-3 py-1.5 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                >
+                  {showImageTemplates ? 'Hide Templates' : 'Templates'}
+                </button>
+              </div>
+              
+              {showImageTemplates && (
+                <div className="mb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                  {imageTemplates.map((template) => (
+                    <button
+                      key={template.id}
+                      onClick={() => {
+                        setImagePrompt(template.prompt);
+                        setShowImageTemplates(false);
+                      }}
+                      className="text-left p-3 bg-[#121620] rounded-md border border-[#1f2532] hover:border-[#8b5cf6] transition-colors"
+                    >
+                      <div className="font-medium text-sm text-[#e5e7eb] mb-1">{template.title}</div>
+                      <div className="text-xs text-[#9ca3af]">{template.description}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <form onSubmit={handleImageGeneration} className="space-y-4">
+                <div>
+                  <label htmlFor="imagePrompt" className="block text-sm font-medium text-[#e5e7eb] mb-2">
+                    Describe the image you want to create
+                  </label>
+                  <textarea
+                    id="imagePrompt"
+                    value={imagePrompt}
+                    onChange={(e) => setImagePrompt(e.target.value)}
+                    placeholder="e.g., A serene landscape with mountains at sunset, painted in watercolor style"
+                    rows={3}
+                    disabled={imageLoading}
+                    className="w-full px-4 py-2 border border-[#1f2532] rounded-lg bg-[#121620] text-[#e5e7eb] placeholder-[#9ca3af] focus:outline-none focus:ring-2 focus:ring-[#8b5cf6] focus:border-transparent disabled:bg-[#0f141e]"
+                  />
+                </div>
+                <motion.button
+                  type="submit"
+                  disabled={imageLoading || !imagePrompt.trim() || credits < 5}
+                  whileHover={{ scale: 1.01 }}
+                  whileTap={{ scale: 0.99 }}
+                  className="w-full px-6 py-3 bg-[#8b5cf6] text-[#e5e7eb] rounded-lg font-medium hover:bg-[#7c3aed] hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-[#8b5cf6] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
+                >
+                  {imageLoading ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                      </svg>
+                      Generating...
+                    </span>
+                  ) : (
+                    'Generate Image (5 credits)'
+                  )}
+                </motion.button>
+              </form>
+            </div>
+
+            {/* Generated Image Display */}
+            <AnimatePresence>
+              {imageLoading && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 transition-colors duration-200"
+                >
+                  <div className="flex items-center justify-center h-96">
+                    <div className="text-center">
+                      {/* Pulsing Image Skeleton */}
+                      <div className="relative">
+                        <div className="w-32 h-32 mx-auto mb-4 rounded-lg bg-gradient-to-r from-gray-200 via-gray-300 to-gray-200 dark:from-gray-700 dark:via-gray-600 dark:to-gray-700 animate-pulse"></div>
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <svg className="w-12 h-12 text-primary-600 dark:text-primary-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                          </svg>
+                        </div>
+                      </div>
+                      <p className="text-[#e5e7eb] font-medium">Generating your masterpiece...</p>
+                      <p className="text-sm text-[#9ca3af] mt-2">This may take a moment</p>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+            <AnimatePresence>
+              {imageError && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                >
+                  <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 px-4 py-3 rounded-lg flex items-start gap-2">
+                    <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                    </svg>
+                    <div className="flex-1">{imageError}</div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {generatedImage && !imageLoading && (
+              <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 transition-colors duration-200">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Generated Image</h3>
+                  <ShareButton
+                    type="image"
+                    userId={user.uid}
+                    prompt={generatedImage.prompt}
+                    imageUrl={generatedImage.url}
+                  />
+                </div>
+                <div className="space-y-4">
+                  <img
+                    src={generatedImage.url}
+                    alt={generatedImage.prompt}
+                    className="w-full rounded-lg shadow-lg"
+                  />
+                  <div className="bg-[#1a1f29] rounded-lg p-4">
+                    <p className="text-sm text-[#9ca3af] mb-1">Prompt:</p>
+                    <p className="text-[#e5e7eb]">{generatedImage.prompt}</p>
+                  </div>
+                  <a
+                    href={generatedImage.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block px-4 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 dark:ring-offset-gray-800 focus:ring-green-500 transition-colors"
+                  >
+                    Open in New Tab
+                  </a>
+                </div>
+              </div>
+            )}
+
+            {/* Image History */}
+            {imageHistory.length > 1 && (
+              <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 transition-colors duration-200">
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Recent Images</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {imageHistory.slice(1).map((image, index) => (
+                    <div key={index} className="space-y-2">
+                      <img
+                        src={image.url}
+                        alt={image.prompt}
+                        className="w-full h-48 object-cover rounded-lg shadow cursor-pointer hover:shadow-lg transition-shadow"
+                        onClick={() => setGeneratedImage(image)}
+                      />
+                      <p className="text-xs text-[#9ca3af] line-clamp-2">{image.prompt}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        </div>
+      </main>
+
+      {/* Custom Delete Confirmation Modal */}
+      {showDeleteModal && threadToDelete && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50">
+          <div className="bg-gray-800 rounded-2xl shadow-2xl w-[500px] mx-4">
+            <div className="px-6 py-5">
+              <div className="mb-6">
+                <h3 className="text-xl font-semibold text-white mb-4">Delete chat?</h3>
+                <p className="text-white text-base mb-2">
+                  This will delete <strong>{threadToDelete.title || 'New Chat'}</strong>.
+                </p>
+                <p className="text-gray-400 text-sm">
+                  Visit <span className="underline cursor-pointer">settings</span> to delete any memories saved during this chat.
+                </p>
+              </div>
+              
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => {
+                    setShowDeleteModal(false);
+                    setThreadToDelete(null);
+                  }}
+                  className="px-5 py-2.5 bg-gray-700 text-white text-base rounded-full hover:bg-gray-600 transition-colors font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => handleDeleteThread(threadToDelete.id)}
+                  className="px-5 py-2.5 bg-red-600 text-white text-base rounded-full hover:bg-red-700 transition-colors font-medium"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Credits Modal */}
+      <CreditsModal
+        isOpen={showCreditsModal}
+        onClose={() => setShowCreditsModal(false)}
+        currentCredits={credits || 0}
+        onCreditsUpdate={setCredits}
+        userId={user?.uid}
+      />
+
+      {/* Feedback Modal */}
+      <FeedbackModal
+        isOpen={showFeedbackModal}
+        onClose={() => setShowFeedbackModal(false)}
+        userId={user?.uid}
+      />
+
+      {/* Copy Toast Notification */}
+      <AnimatePresence>
+        {showCopyToast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 50, scale: 0.9 }}
+            transition={{ 
+              type: "spring", 
+              stiffness: 300, 
+              damping: 30,
+              duration: 0.3 
+            }}
+            className="fixed bottom-6 right-6 z-50 bg-[#121620] border border-[#1f2532] rounded-2xl px-5 py-4 shadow-xl"
+          >
+            <div className="flex items-center gap-3">
+              <motion.div
+                initial={{ scale: 0, rotate: -180 }}
+                animate={{ scale: 1, rotate: 0 }}
+                transition={{ delay: 0.1, duration: 0.3 }}
+                className="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center"
+              >
+                <Check className="w-4 h-4 text-white" />
+              </motion.div>
+              <span className="text-[#e5e7eb] font-medium">Copied to clipboard!</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Theme Selector Modal */}
+      <ThemeSelector 
+        isOpen={isThemeSelectorOpen} 
+        onClose={() => setIsThemeSelectorOpen(false)} 
+      />
+
+      {/* Mobile Floating New Chat Button */}
+      <motion.button
+        initial={{ scale: 0, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        whileHover={{ scale: 1.1 }}
+        whileTap={{ scale: 0.9 }}
+        onClick={handleNewChat}
+        className="fixed bottom-20 right-4 md:hidden z-50 w-14 h-14 bg-gradient-to-r from-primary-600 to-purple-600 text-white rounded-full shadow-lg hover:shadow-xl transition-all duration-200 flex items-center justify-center"
+        title="Start New Chat"
+      >
+        <Plus className="w-6 h-6" />
+      </motion.button>
+    </div>
+  );
+}
+
+
